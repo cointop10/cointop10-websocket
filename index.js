@@ -18,40 +18,11 @@ app.use((req, res, next) => {
 
 // 사용자별 WebSocket 구독 관리
 const userSubscriptions = new Map(); // key: exchange-symbol-timeframe, value: Set<userId>
-const activeConnections = new Map(); // key: exchange-symbol-1m, value: WebSocket
-const candleBuffers = new Map(); // key: userId, value: { candles: [], targetTimeframe: '15m' }
+const activeConnections = new Map(); // key: exchange-symbol, value: WebSocket
 
-// 타임프레임을 분 단위로 변환
-function timeframeToMinutes(timeframe) {
-  const map = { '1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240 };
-  return map[timeframe] || 1;
-}
-
-// 1분봉을 타겟 타임프레임으로 변환
-function convertToTargetTimeframe(candles, targetTimeframe) {
-  const minutes = timeframeToMinutes(targetTimeframe);
-  
-  if (candles.length < minutes) return null;
-  
-  // 마지막 N개 캔들 가져오기
-  const chunk = candles.slice(-minutes);
-  
-  return {
-    exchange: chunk[0].exchange,
-    symbol: chunk[0].symbol,
-    timeframe: targetTimeframe,
-    timestamp: chunk[0].timestamp,
-    open: chunk[0].open,
-    high: Math.max(...chunk.map(c => c.high)),
-    low: Math.min(...chunk.map(c => c.low)),
-    close: chunk[chunk.length - 1].close,
-    volume: chunk.reduce((sum, c) => sum + c.volume, 0)
-  };
-}
-
-// WebSocket 연결 (항상 1분봉)
+// WebSocket 연결 (항상 1분봉만!)
 function connectExchange(exchange, symbol) {
-  const key = `${exchange}-${symbol}-1m`;  // ✅ 항상 1분봉!
+  const key = `${exchange}-${symbol}`;
   
   if (activeConnections.has(key)) {
     console.log(`✅ Already connected: ${key}`);
@@ -62,10 +33,10 @@ function connectExchange(exchange, symbol) {
   
   switch (exchange.toLowerCase()) {
     case 'binance':
-      wsUrl = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_1m`;  // ✅ 1m
+      wsUrl = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_1m`;
       break;
     case 'binance-testnet':
-      wsUrl = `wss://stream.binancefuture.com/ws/${symbol.toLowerCase()}@kline_1m`;  // ✅ 1m
+      wsUrl = `wss://stream.binancefuture.com/ws/${symbol.toLowerCase()}@kline_1m`;
       break;
     case 'bybit':
       wsUrl = 'wss://stream.bybit.com/v5/public/linear';
@@ -78,7 +49,7 @@ function connectExchange(exchange, symbol) {
       return;
   }
 
-  console.log(`🔌 Connecting to ${key}...`);
+  console.log(`🔌 Connecting to ${key} (1m candles)...`);
   const ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
@@ -89,7 +60,7 @@ function connectExchange(exchange, symbol) {
     if (exchange.toLowerCase().includes('bybit')) {
       ws.send(JSON.stringify({
         op: 'subscribe',
-        args: [`kline.1.${symbol}`]  // ✅ 1분봉
+        args: [`kline.1.${symbol}`]
       }));
       console.log(`📡 Bybit subscribed: kline.1.${symbol}`);
     }
@@ -99,7 +70,7 @@ function connectExchange(exchange, symbol) {
     try {
       const message = JSON.parse(data);
       
-      // Binance 1분봉 캔들
+      // Binance 1분봉
       if (message.e === 'kline' && message.k && message.k.x) {
         const candle = {
           exchange,
@@ -113,21 +84,19 @@ function connectExchange(exchange, symbol) {
           volume: parseFloat(message.k.v)
         };
         
-        console.log(`📊 1m Candle (Binance): ${symbol} ${candle.close}`);
+        console.log(`📊 1m Candle: ${symbol} ${candle.close}`);
         
-        // 모든 구독자의 버퍼에 추가
+        // 모든 구독자에게 1분봉 그대로 전송
         for (const [subKey, users] of userSubscriptions.entries()) {
           if (subKey.startsWith(`${exchange}-${symbol}-`)) {
-            const targetTimeframe = subKey.split('-')[2];
-            
             for (const userId of users) {
-              await processCandle(candle, userId, targetTimeframe);
+              await sendToWorker(candle, userId);
             }
           }
         }
       }
       
-      // Bybit 1분봉 캔들
+      // Bybit 1분봉
       if (message.topic && message.topic.startsWith('kline') && message.data) {
         for (const kline of message.data) {
           if (!kline.confirm) continue;
@@ -144,21 +113,19 @@ function connectExchange(exchange, symbol) {
             volume: parseFloat(kline.volume)
           };
           
-          console.log(`📊 1m Candle (Bybit): ${symbol} ${candle.close}`);
+          console.log(`📊 1m Candle: ${symbol} ${candle.close}`);
           
           for (const [subKey, users] of userSubscriptions.entries()) {
             if (subKey.startsWith(`${exchange}-${symbol}-`)) {
-              const targetTimeframe = subKey.split('-')[2];
-              
               for (const userId of users) {
-                await processCandle(candle, userId, targetTimeframe);
+                await sendToWorker(candle, userId);
               }
             }
           }
         }
       }
     } catch (error) {
-      console.error(`⚠️ Message parse error (${key}):`, error.message);
+      console.error(`⚠️ Message parse error:`, error.message);
     }
   });
 
@@ -183,39 +150,7 @@ function connectExchange(exchange, symbol) {
   });
 }
 
-// 1분봉 처리 및 변환
-async function processCandle(candle1m, userId, targetTimeframe) {
-  const bufferKey = `${userId}-${candle1m.exchange}-${candle1m.symbol}`;
-  
-  if (!candleBuffers.has(bufferKey)) {
-    candleBuffers.set(bufferKey, { candles: [], targetTimeframe });
-  }
-  
-  const buffer = candleBuffers.get(bufferKey);
-  buffer.candles.push(candle1m);
-  
-  const requiredCandles = timeframeToMinutes(targetTimeframe);
-  
-  // 버퍼 크기 제한
-  if (buffer.candles.length > requiredCandles * 2) {
-    buffer.candles = buffer.candles.slice(-requiredCandles * 2);
-  }
-  
-  // 타겟 타임프레임으로 변환
-  if (buffer.candles.length >= requiredCandles) {
-    const convertedCandle = convertToTargetTimeframe(buffer.candles, targetTimeframe);
-    
-    if (convertedCandle) {
-      console.log(`🔄 Converted to ${targetTimeframe}: ${convertedCandle.symbol} ${convertedCandle.close}`);
-      await sendToWorker(convertedCandle, userId);
-      
-      // 변환 완료 후 버퍼에서 사용한 캔들 제거
-      buffer.candles = buffer.candles.slice(requiredCandles);
-    }
-  }
-}
-
-// Worker로 캔들 전송
+// Worker로 1분봉 전송 (그대로!)
 async function sendToWorker(candle, userId) {
   try {
     const response = await fetch('https://cointop10-forward.cointop10-com.workers.dev/api/new-candle', {
@@ -228,10 +163,10 @@ async function sendToWorker(candle, userId) {
     });
     
     if (!response.ok) {
-      console.error(`❌ Worker response error (user ${userId}):`, response.status);
+      console.error(`❌ Worker response error:`, response.status);
     }
   } catch (error) {
-    console.error(`❌ Send to worker failed (user ${userId}):`, error.message);
+    console.error(`❌ Send to worker failed:`, error.message);
   }
 }
 
@@ -257,15 +192,15 @@ app.post('/connect', (req, res) => {
   console.log(`👤 User ${userId} subscribed to ${key}`);
   console.log(`📊 Total subscribers for ${key}: ${userSubscriptions.get(key).size}`);
   
-  // WebSocket 연결 (항상 1분봉으로!)
-  const baseKey = `${exchange}-${symbol}-1m`;
+  // WebSocket 연결 (항상 1분봉)
+  const baseKey = `${exchange}-${symbol}`;
   if (!activeConnections.has(baseKey)) {
     connectExchange(exchange, symbol);
   }
   
   res.json({ 
     success: true, 
-    message: `Connected to ${key} (via 1m candles)`,
+    message: `Connected to ${key} (receiving 1m candles)`,
     subscribers: userSubscriptions.get(key).size
   });
 });
@@ -302,7 +237,7 @@ app.post('/disconnect', (req, res) => {
       }
       
       if (!hasOtherSubs) {
-        const baseKey = `${exchange}-${symbol}-1m`;
+        const baseKey = `${exchange}-${symbol}`;
         if (activeConnections.has(baseKey)) {
           activeConnections.get(baseKey).close();
           activeConnections.delete(baseKey);
@@ -311,10 +246,6 @@ app.post('/disconnect', (req, res) => {
       }
     }
   }
-  
-  // 버퍼 정리
-  const bufferKey = `${userId}-${exchange}-${symbol}`;
-  candleBuffers.delete(bufferKey);
   
   res.json({ success: true, message: `Disconnected from ${key}` });
 });
@@ -346,8 +277,7 @@ app.post('/proxy/binance', async (req, res) => {
 app.get('/status', (req, res) => {
   const status = {
     activeConnections: Array.from(activeConnections.keys()),
-    userSubscriptions: {},
-    candleBuffers: Array.from(candleBuffers.keys())
+    userSubscriptions: {}
   };
   
   for (const [key, users] of userSubscriptions.entries()) {
@@ -362,18 +292,17 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     connections: activeConnections.size,
     totalSubscribers: Array.from(userSubscriptions.values()).reduce((sum, set) => sum + set.size, 0),
-    buffers: candleBuffers.size,
     uptime: process.uptime()
   });
 });
 
 app.get('/', (req, res) => {
-  res.send('CoinTop10 WebSocket Bridge - 1m to Any Timeframe (Backtest Compatible)');
+  res.send('CoinTop10 WebSocket Bridge - 1m Candles Only (Backtest Compatible)');
 });
 
 app.listen(PORT, () => {
   console.log(`🚀 Railway WebSocket Bridge running on port ${PORT}`);
-  console.log('✅ Multi-user support enabled');
-  console.log('✅ 1m candles → Any timeframe conversion');
+  console.log('✅ Sending 1m candles only');
+  console.log('✅ Worker will handle conversion');
   console.log('✅ Backtest compatible mode');
 });
