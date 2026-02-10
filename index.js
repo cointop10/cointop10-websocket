@@ -1,9 +1,11 @@
 const express = require('express');
 const WebSocket = require('ws');
-const crypto = require('crypto');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
 
 // CORS
 app.use((req, res, next) => {
@@ -18,83 +20,134 @@ app.use((req, res, next) => {
 const userSubscriptions = new Map(); // key: exchange-symbol-timeframe, value: Set<userId>
 const activeConnections = new Map(); // key: exchange-symbol-timeframe, value: WebSocket
 
-// Binance WebSocket 연결
-function connectBinanceWS(exchange, symbol, timeframe, isTestnet) {
+// WebSocket 연결
+function connectExchange(exchange, symbol, timeframe) {
   const key = `${exchange}-${symbol}-${timeframe}`;
   
   if (activeConnections.has(key)) {
     console.log(`✅ Already connected: ${key}`);
     return;
   }
+
+  let wsUrl;
   
-  const baseUrl = isTestnet 
-    ? 'wss://stream.binancefuture.com'
-    : 'wss://fstream.binance.com';
-  
-  const stream = `${symbol.toLowerCase()}@kline_${timeframe}`;
-  const wsUrl = `${baseUrl}/ws/${stream}`;
-  
-  console.log(`🔌 Connecting to: ${wsUrl}`);
-  
+  switch (exchange.toLowerCase()) {
+    case 'binance':
+      wsUrl = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_${timeframe}`;
+      break;
+    case 'binance-testnet':
+      wsUrl = `wss://stream.binancefuture.com/ws/${symbol.toLowerCase()}@kline_${timeframe}`;
+      break;
+    case 'bybit':
+      wsUrl = 'wss://stream.bybit.com/v5/public/linear';
+      break;
+    case 'bybit-testnet':
+      wsUrl = 'wss://stream-demo.bybit.com/v5/public/linear';
+      break;
+    default:
+      console.error(`❌ Unsupported exchange: ${exchange}`);
+      return;
+  }
+
+  console.log(`🔌 Connecting to ${key}...`);
   const ws = new WebSocket(wsUrl);
-  
+
   ws.on('open', () => {
     console.log(`✅ Connected: ${key}`);
     activeConnections.set(key, ws);
+    
+    // Bybit 구독
+    if (exchange.toLowerCase().includes('bybit')) {
+      ws.send(JSON.stringify({
+        op: 'subscribe',
+        args: [`kline.${timeframe}.${symbol}`]
+      }));
+      console.log(`📡 Bybit subscribed: kline.${timeframe}.${symbol}`);
+    }
   });
-  
-  ws.on('message', (data) => {
+
+  ws.on('message', async (data) => {
     try {
-      const parsed = JSON.parse(data);
-      if (parsed.e === 'kline' && parsed.k.x) {
+      const message = JSON.parse(data);
+      
+      // Binance 캔들
+      if (message.e === 'kline' && message.k && message.k.x) {
         const candle = {
-          exchange: exchange,
-          symbol: symbol,
-          timeframe: timeframe,
-          timestamp: parsed.k.T,
-          open: parseFloat(parsed.k.o),
-          high: parseFloat(parsed.k.h),
-          low: parseFloat(parsed.k.l),
-          close: parseFloat(parsed.k.c),
-          volume: parseFloat(parsed.k.v)
+          exchange,
+          symbol,
+          timeframe,
+          timestamp: message.k.t,
+          open: parseFloat(message.k.o),
+          high: parseFloat(message.k.h),
+          low: parseFloat(message.k.l),
+          close: parseFloat(message.k.c),
+          volume: parseFloat(message.k.v)
         };
         
-        console.log(`📊 Candle sent: ${key} ${candle.close}`);
+        console.log(`📊 Candle (Binance): ${key} ${candle.close}`);
         
-        // 이 symbol/timeframe을 구독 중인 모든 사용자에게 전송
+        // 이 구독을 가진 모든 사용자에게 전송
         const users = userSubscriptions.get(key);
         if (users && users.size > 0) {
           for (const userId of users) {
-            sendCandleToWorker(candle, userId);
+            await sendToWorker(candle, userId);
+          }
+        }
+      }
+      
+      // Bybit 캔들
+      if (message.topic && message.topic.startsWith('kline') && message.data) {
+        for (const kline of message.data) {
+          if (!kline.confirm) continue;
+          
+          const candle = {
+            exchange,
+            symbol,
+            timeframe,
+            timestamp: kline.start,
+            open: parseFloat(kline.open),
+            high: parseFloat(kline.high),
+            low: parseFloat(kline.low),
+            close: parseFloat(kline.close),
+            volume: parseFloat(kline.volume)
+          };
+          
+          console.log(`📊 Candle (Bybit): ${key} ${candle.close}`);
+          
+          const users = userSubscriptions.get(key);
+          if (users && users.size > 0) {
+            for (const userId of users) {
+              await sendToWorker(candle, userId);
+            }
           }
         }
       }
     } catch (error) {
-      console.error('❌ Parse error:', error);
+      console.error(`⚠️ Message parse error (${key}):`, error.message);
     }
   });
-  
-  ws.on('error', (error) => {
-    console.error(`❌ WebSocket error (${key}):`, error);
-  });
-  
+
   ws.on('close', () => {
-    console.log(`🔌 Disconnected: ${key}`);
+    console.log(`❌ Disconnected: ${key}`);
     activeConnections.delete(key);
     
-    // 재연결 (5초 후)
+    // 재연결 (구독자가 있으면)
     setTimeout(() => {
       const users = userSubscriptions.get(key);
       if (users && users.size > 0) {
         console.log(`🔄 Reconnecting: ${key}`);
-        connectBinanceWS(exchange, symbol, timeframe, isTestnet);
+        connectExchange(exchange, symbol, timeframe);
       }
     }, 5000);
+  });
+
+  ws.on('error', (error) => {
+    console.error(`❌ WebSocket error (${key}):`, error.message);
   });
 }
 
 // Worker로 캔들 전송
-async function sendCandleToWorker(candle, userId) {
+async function sendToWorker(candle, userId) {
   try {
     const response = await fetch('https://cointop10-forward.cointop10-com.workers.dev/api/new-candle', {
       method: 'POST',
@@ -137,20 +190,14 @@ app.post('/connect', (req, res) => {
   
   // WebSocket 연결 (없으면 생성)
   if (!activeConnections.has(key)) {
-    const isTestnet = exchange.includes('testnet');
-    const baseExchange = exchange.replace('-testnet', '');
-    
-    if (baseExchange === 'binance') {
-      connectBinanceWS(exchange, symbol, timeframe, isTestnet);
-    } else {
-      return res.status(400).json({ 
-        success: false, 
-        error: `Exchange ${baseExchange} not supported yet` 
-      });
-    }
+    connectExchange(exchange, symbol, timeframe);
   }
   
-  res.json({ success: true, message: `Connected to ${key}` });
+  res.json({ 
+    success: true, 
+    message: `Connected to ${key}`,
+    subscribers: userSubscriptions.get(key).size
+  });
 });
 
 // 연결 해제
@@ -180,6 +227,8 @@ app.post('/disconnect', (req, res) => {
         activeConnections.delete(key);
         console.log(`🔌 WebSocket closed: ${key} (no subscribers)`);
       }
+    } else {
+      console.log(`📊 Remaining subscribers for ${key}: ${userSubscriptions.get(key).size}`);
     }
   }
   
@@ -191,14 +240,20 @@ app.post('/proxy/binance', async (req, res) => {
   try {
     const { url, method, headers } = req.body;
     
+    console.log('🔗 Proxying:', url);
+    
     const response = await fetch(url, {
-      method: method,
-      headers: headers
+      method: method || 'GET',
+      headers: headers || {}
     });
     
     const data = await response.text();
+    
+    console.log('📡 Proxy response:', response.status);
+    
     res.status(response.status).send(data);
   } catch (error) {
+    console.error('❌ Proxy error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -217,12 +272,21 @@ app.get('/status', (req, res) => {
   res.json(status);
 });
 
-app.get('/', (req, res) => {
-  res.send('CoinTop10 WebSocket Bridge - Multi-User Support');
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    connections: activeConnections.size,
+    totalSubscribers: Array.from(userSubscriptions.values()).reduce((sum, set) => sum + set.size, 0),
+    uptime: process.uptime()
+  });
 });
 
-const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => {
+  res.send('CoinTop10 WebSocket Bridge - Multi-User Support (Binance + Bybit)');
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Railway WebSocket Bridge running on port ${PORT}`);
   console.log('✅ Multi-user support enabled');
+  console.log('✅ Binance & Bybit supported');
 });
