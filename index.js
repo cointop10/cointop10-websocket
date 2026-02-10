@@ -183,3 +183,28 @@ app.listen(PORT, () => {
   console.log(`🚀 Railway WebSocket Bridge running on port ${PORT}`);
   console.log(`📡 Worker URL: ${WORKER_URL}`);
 });
+
+// Binance API 프록시
+app.post('/proxy/binance', express.json(), async (req, res) => {
+  try {
+    const { url, method, headers } = req.body;
+    
+    console.log('🔗 Proxying:', url);
+    
+    const response = await fetch(url, {
+      method: method || 'GET',
+      headers: headers || {}
+    });
+    
+    const data = await response.text();
+    
+    console.log('📡 Proxy response:', response.status);
+    
+    res.status(response.status).send(data);
+  } catch (error) {
+    console.error('❌ Proxy error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+console.log('✅ Binance proxy endpoint added');
