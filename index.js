@@ -1,3 +1,4 @@
+const fetch = require('node-fetch');
 const WebSocket = require('ws');
 const express = require('express');
 
